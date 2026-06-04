@@ -11,6 +11,7 @@ dependencies = [
     "transformers~=5.9.0",
     "torch~=2.12.0",
     "accelerate~=1.13.0",
+    "tqdm>=4.60",
 ]
 
 [project.optional-dependencies]

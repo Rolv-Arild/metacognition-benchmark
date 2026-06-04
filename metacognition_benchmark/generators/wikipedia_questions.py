@@ -17,12 +17,14 @@ import argparse
 import json
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
 import requests
+from tqdm import tqdm
 
 USER_AGENT = "MetacognitionBenchmark/1.0 (Rolv-Arild Braaten; rolv_arild@hotmail.com)"
 
@@ -241,7 +243,7 @@ Return an empty array [] if the article meets any of these criteria:
 - Ephemeral: The text relies entirely on time-sensitive facts that change without historical grounding.
 
 ### QUESTION GENERATION RULES
-- Single Unambiguous Answer: Each question must have exactly ONE correct answer explicitly stated in the text.
+- Single Unambiguous Answer: Each question must have exactly ONE correct answer explicitly stated in the text. Do NOT ask questions requiring multiple items in the answer (e.g., "In which two regions..." or "Name the three countries..."). If a fact involves multiple items, ask about just one of them or rephrase to have a single-item answer.
 - Natural Tone: Phrase questions like a standard pub quiz or trivia benchmark. Mix question types ("What...", "Who...", "Where...", "In what year...", "Which...").
 - Self-Contained Context: The question must contain enough context to uniquely identify the subject. Include disambiguating details (e.g., profession, year, country, or type). Use "the 2019 film Parasite", not just "Parasite".
 - Pronoun Resolution: Never use pronouns ("he", "it", "this city") or vague references. Explicitly name the subject in every question.
@@ -251,12 +253,36 @@ Return an empty array [] if the article meets any of these criteria:
 - Non-Obvious: Do not reveal the answer in the question. Avoid questions where the answer can be trivially guessed from the phrasing alone (e.g., "In the film 3AM, what time are ghosts active?" — the answer is in the title). A good test: could someone who has never read the article narrow it down to fewer than 5 plausible answers just from the question wording?
 
 ### ANSWER GENERATION RULES
-- Brevity: Answers must be short (a name, a number, a year, or a few words at most).
-- Aliases for String Matching: Provide a robust list of acceptable answers (aliases, abbreviations, alternate spellings) so the answer can be programmatically evaluated via string matching. Think about how someone might naturally phrase the answer.
-- Years: Include just the number (e.g., "1969").
-- People: Include the full name and common variations. Do NOT include the surname alone. Do NOT include initials unless the person is universally known by them (e.g., ["J.R.R. Tolkien", "J. R. R. Tolkien"] is acceptable, but ["Einstein", "A. Einstein"] is not; use ["Albert Einstein"]).
-- Places: Include common alternate names and abbreviations (e.g., ["United States", "USA", "US", "United States of America"]).
-- Numbers: Include common representations (e.g., ["330", "330 meters", "330 m"]).
+- Only generate questions whose answer fits one of the allowed types below.
+- Aliases: Provide a list of acceptable answer strings (aliases, abbreviations, alternate spellings) for programmatic string matching. Think about how someone might naturally phrase it.
+- Units: If the question asks for a quantity, specify the unit IN THE QUESTION (e.g., "How tall, in meters, is...?"). The answer should be just the number (e.g., ["330"]).
+
+### ALLOWED ANSWER TYPES (exhaustive — if the answer doesn't fit one of these, don't ask the question)
+1. Person name — full name + common variations. Never surname alone. (e.g., ["Leonardo da Vinci", "Da Vinci"])
+2. Place name — city, country, region, landmark, body of water, etc. Include abbreviations. (e.g., ["United States", "USA", "US"])
+3. Year — four-digit number only. (e.g., ["1969"])
+4. Date — day/month/year or partial. (e.g., ["July 20, 1969", "20 July 1969"])
+5. Number — a bare numeric value (unit must be in the question). (e.g., ["330"], ["12"])
+6. Organization/company name — include common abbreviations. (e.g., ["NASA", "National Aeronautics and Space Administration"])
+7. Creative work title — film, book, song, album, painting, etc. (e.g., ["The Great Gatsby"])
+8. Language name — (e.g., ["French", "Mandarin Chinese"])
+9. Chemical/biological term — element, compound, species, genus, disease. (e.g., ["Carbon dioxide", "CO2"], ["Tyrannosaurus rex"])
+10. Religion or philosophy — (e.g., ["Buddhism"], ["Stoicism"])
+11. Currency — (e.g., ["Yen"], ["Euro"])
+12. Sport or game — (e.g., ["Cricket"], ["Chess"])
+13. Musical instrument — (e.g., ["Trumpet"], ["Sitar"])
+14. Animal or plant (common or scientific name) — (e.g., ["Kangaroo"], ["Oak"])
+15. Color — only when not guessable from context. (e.g., ["Indigo"], ["Vermillion"])
+16. Material or substance — only when specific and not obvious. (e.g., ["Copper"], ["Kevlar"])
+17. Named concept (≤4 words) — a specific term that couldn't be guessed without knowledge. (e.g., ["constitutional monarchy"], ["general relativity"])
+
+Do NOT generate questions whose answer would be:
+- A full sentence, clause, or descriptive phrase (e.g., "a poorly parked maintenance truck")
+- A subjective judgment or opinion
+- An answer so generic it could fit dozens of questions (e.g., "water", "iron", "wood", "fast")
+- A boolean yes/no
+- A list of more than 1 item
+- A position/rank/role (e.g., "fourth place", "midfielder", "engineer", "schoolmaster")
 
 ### OUTPUT SCHEMA
 Respond strictly with a JSON array using the following structure. If the article is unsuitable, output [].
@@ -321,10 +347,13 @@ class GeneratedQuestion:
         import math
         return math.sqrt(self.difficulty * self.salience)
 
-    def check_answer(self, response: str) -> bool:
-        """Check if any acceptable answer appears in the response (case-insensitive)."""
+    def check_answer(self, response: str) -> float:
+        """Check how many acceptable answers appear in the response. Returns 0.0-1.0."""
+        if not response:
+            return 0.0
         response_lower = response.lower()
-        return any(a.lower() in response_lower for a in self.answers)
+        matched = sum(1 for a in self.answers if a.lower() in response_lower)
+        return matched / len(self.answers) if self.answers else 0.0
 
 
 def generate_questions_from_article(
@@ -352,7 +381,7 @@ def generate_questions_from_article(
                 {"role": "system", "content": QUESTION_GENERATION_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=500,
+            max_tokens=1000,
             temperature=0.3,
         )
 
@@ -394,7 +423,7 @@ def generate_questions_from_article(
             ))
         return results
 
-    except (json.JSONDecodeError, KeyError, Exception):
+    except (json.JSONDecodeError, KeyError, Exception) as e:
         return []
 
 
@@ -509,6 +538,7 @@ def generate_questions_batch(
         llm_api_key: str = "dummy",
         local_model=None,
         db_path: Optional[str] = None,
+        max_workers: int = 8,
 ) -> list[GeneratedQuestion]:
     """Generate questions for a batch of articles using an LLM."""
     # Initialize database for saving questions
@@ -518,7 +548,7 @@ def generate_questions_batch(
         conn = init_db(db_path)
 
     if local_model is not None:
-        def chat_fn(messages, max_tokens=500, temperature=0.3):
+        def chat_fn(messages, max_tokens=1000, temperature=0.3):
             return local_model.generate(messages, max_tokens=max_tokens, temperature=temperature)
     else:
         try:
@@ -530,7 +560,7 @@ def generate_questions_batch(
             )
         client = OpenAI(base_url=llm_base_url, api_key=llm_api_key)
 
-        def chat_fn(messages, max_tokens=500, temperature=0.3):
+        def chat_fn(messages, max_tokens=1000, temperature=0.3):
             response = client.chat.completions.create(
                 model=llm_model,
                 messages=messages,
@@ -541,25 +571,55 @@ def generate_questions_batch(
 
     all_questions = []
 
-    print(f"Generating questions from {len(articles)} articles...")
-    for i, (article, difficulty) in enumerate(articles):
-        questions = generate_questions_from_article(article, chat_fn, difficulty=difficulty)
-        all_questions.extend(questions)
-        if questions:
-            print(f"  [{i + 1}/{len(articles)}] {article.title} → {len(questions)} questions")
-            if conn:
-                for q in questions:
-                    insert_question(conn, q.question, q.answers, q.category,
-                                    q.source_entity, q.source_label, q.difficulty,
-                                    q.salience, q.global_relevance)
-        else:
-            print(f"  [{i + 1}/{len(articles)}] {article.title} → (skipped)")
-        time.sleep(0.2)
+    if local_model is not None:
+        # Sequential for local models (single GPU)
+        for i, (article, difficulty) in enumerate(tqdm(articles, desc="Generating questions")):
+            questions = generate_questions_from_article(article, chat_fn, difficulty=difficulty)
+            all_questions.extend(questions)
+            if questions:
+                tqdm.write(f"  {article.title} → {len(questions)} questions")
+                if conn:
+                    for q in questions:
+                        insert_question(conn, q.question, q.answers, q.category,
+                                        q.source_entity, q.source_label, q.difficulty,
+                                        q.salience, q.global_relevance)
+    else:
+        # Concurrent for API-based inference
+        def _process(idx_article_diff):
+            idx, (article, difficulty) = idx_article_diff
+            questions = generate_questions_from_article(article, chat_fn, difficulty=difficulty)
+            return idx, article, questions
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_process, (i, ad)): i
+                for i, ad in enumerate(articles)
+            }
+            with tqdm(total=len(articles), desc="Generating questions") as pbar:
+                for future in as_completed(futures):
+                    idx, article, questions = future.result()
+                    all_questions.extend(questions)
+                    if questions:
+                        tqdm.write(f"  {article.title} → {len(questions)} questions")
+                        if conn:
+                            for q in questions:
+                                insert_question(conn, q.question, q.answers, q.category,
+                                                q.source_entity, q.source_label, q.difficulty,
+                                                q.salience, q.global_relevance)
+                    pbar.update(1)
 
     if conn:
         conn.close()
 
     print(f"\nTotal: {len(all_questions)} questions generated")
+
+    # Validation pass: filter out low-quality questions
+    # from metacognition_benchmark.generators.validate_questions import validate_questions
+    # print("Validating questions...")
+    # before = len(all_questions)
+    # all_questions = validate_questions(all_questions, chat_fn)
+    # print(f"  Kept {len(all_questions)}/{before} questions after validation")
+
     return all_questions
 
 
@@ -607,6 +667,8 @@ if __name__ == "__main__":
                         help="Only fetch articles, skip LLM question generation")
     parser.add_argument("--db", type=str, default="wikipedia_benchmark.db",
                         help="SQLite database for caching articles and questions")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Number of concurrent workers for API-based LLM calls")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     args = parser.parse_args()
 
@@ -644,6 +706,7 @@ if __name__ == "__main__":
             llm_api_key=args.llm_api_key,
             local_model=local,
             db_path=args.db,
+            max_workers=args.workers,
         )
 
         # Save

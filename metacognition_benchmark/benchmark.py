@@ -178,92 +178,172 @@ class MetacognitionBenchmark:
     # General Questions
     # ------------------------------------------------------------------
 
-    def run_general_question(self, question: str, expected_answer: str, difficulty: int = 3, category: str = "", answer_checker=None) -> GeneralQuestionResult:
-        """Run a general factual question with string answer.
+    def run_general_question(self, question: str, expected_answers: list[str], difficulty: int = 3, category: str = "", answer_checker=None) -> GeneralQuestionResult:
+        """Run a general factual question in three modes: minimal, refusal-encouraged, forced.
 
-        If answer_checker is provided (callable(str) -> bool), uses it for correctness.
-        Otherwise falls back to LLM-as-judge.
+        expected_answers: list of acceptable answers (first is primary).
+        If answer_checker is provided (callable(str) -> float|bool), uses it for correctness.
+        Otherwise uses normalized text matching (with optional LLM judge fallback).
         """
-        # Mode 1: Allow refusal
-        refusal_prompt = (
-            f"{question}\n\n"
-            f"Answer concisely (a few words). "
-            f"If you are not confident, respond with exactly: IDK\n"
-            f"If you do answer, also state your confidence (0-100%).\n"
-            f"Format:\nANSWER: <your answer>\nCONFIDENCE: <percent>"
-        )
-        text1 = self._chat([{"role": "user", "content": refusal_prompt}], max_tokens=100)
-        model_answer, model_refused, model_confidence = parse_general_response(text1)
+        native = self.config.prompt_mode == "native"
 
-        # Mode 2: Force answer
-        force_prompt = (
-            f"{question}\n\n"
-            f"You MUST answer, even if you're unsure. Be concise (a few words).\n"
-            f"Format: ANSWER: <your answer>"
-        )
-        text2 = self._chat([{"role": "user", "content": force_prompt}], max_tokens=100)
+        # Mode 1: Minimal — just ask the question, see what the model does naturally
+        if native:
+            minimal_prompt = question
+        else:
+            minimal_prompt = (
+                f"{question}\n\n"
+                f"Answer concisely (a name, year, number, or short phrase).\n"
+                f"Format: ANSWER: <your answer>"
+            )
+        text0 = self._chat([{"role": "user", "content": minimal_prompt}], max_tokens=50 if not native else 200)
+        minimal_answer, minimal_refused, _ = parse_general_response(text0)
+
+        # Mode 2: Refusal encouraged — explicitly allow IDK
+        if native:
+            refusal_prompt = f"{question}\nIf you don't know, say \"IDK\"."
+        else:
+            refusal_prompt = (
+                f"{question}\n\n"
+                f"Answer concisely (a name, year, number, or short phrase).\n"
+                f"If you don't know, respond with exactly: IDK\n"
+                f"Format: ANSWER: <your answer>"
+            )
+        text1 = self._chat([{"role": "user", "content": refusal_prompt}], max_tokens=50 if not native else 200)
+        model_answer, model_refused, _ = parse_general_response(text1)
+
+        # Mode 3: Forced answer — must give best guess
+        if native:
+            force_prompt = f"{question}\nYou must give your best guess."
+        else:
+            force_prompt = (
+                f"{question}\n\n"
+                f"Answer concisely (a name, year, number, or short phrase).\n"
+                f"You MUST answer, even if you're unsure. Be concise (a few words).\n"
+                f"Format: ANSWER: <your answer>"
+            )
+        text2 = self._chat([{"role": "user", "content": force_prompt}], max_tokens=50 if not native else 200)
         forced_answer, _, _ = parse_general_response(text2)
 
-        # Judge correctness
-        if answer_checker:
-            is_correct = answer_checker(model_answer) if model_answer else False
-            forced_is_correct = answer_checker(forced_answer) if forced_answer else False
-        else:
-            is_correct = self._judge_answer(question, expected_answer, model_answer) if model_answer else False
-            forced_is_correct = self._judge_answer(question, expected_answer, forced_answer) if forced_answer else False
+        # Judge correctness for each mode
+        def score(answer):
+            if not answer:
+                return 0.0
+            if answer_checker:
+                s = answer_checker(answer)
+                return 1.0 if s is True else (0.0 if s is False else float(s))
+            return self._judge_answer(question, expected_answers, answer)
 
         return GeneralQuestionResult(
             question=question,
-            expected_answer=expected_answer,
+            expected_answer=expected_answers[0] if expected_answers else "",
+            minimal_answer=minimal_answer,
+            minimal_refused=minimal_refused,
             model_answer=model_answer,
             model_refused=model_refused,
-            model_confidence=model_confidence,
             forced_answer=forced_answer,
             difficulty=difficulty,
             category=category,
-            is_correct=is_correct,
-            forced_is_correct=forced_is_correct,
+            minimal_is_correct=score(minimal_answer),
+            is_correct=score(model_answer),
+            forced_is_correct=score(forced_answer),
         )
 
     # ------------------------------------------------------------------
     # Judge
     # ------------------------------------------------------------------
 
-    def _judge_answer(self, question: str, expected: str, given: str) -> bool:
-        """Use LLM-as-judge to determine if the given answer is correct."""
-        if not given:
-            return False
-        if given.strip().lower() == expected.strip().lower():
-            return True
+    def _judge_answer(self, question: str, expected_answers: list[str], given: str) -> float:
+        """Score an answer using normalized text matching.
 
+        Returns: 0.0 (wrong) to 1.0 (correct), with partial credit.
+        Falls back to LLM judge only if use_llm_judge is configured.
+        """
+        if not given:
+            return 0.0
+
+        # Normalize for comparison
+        def normalize(s: str) -> str:
+            """Normalize a string for flexible matching."""
+            s = s.lower().strip()
+            # Strip leading articles
+            for article in ("the ", "a ", "an ", "l'", "la ", "le ", "les "):
+                if s.startswith(article):
+                    s = s[len(article):]
+            # Remove punctuation except hyphens and apostrophes within words
+            s = "".join(c if c.isalnum() or c in "-' " else " " for c in s)
+            # Collapse whitespace
+            return " ".join(s.split())
+
+        given_norm = normalize(given)
+
+        # Check each acceptable answer
+        matched = 0
+        for answer in expected_answers:
+            ans_norm = normalize(answer)
+            # Exact normalized match
+            if ans_norm == given_norm:
+                matched += 1
+                continue
+            # Substring match (answer in response or response in answer)
+            if ans_norm in given_norm or given_norm in ans_norm:
+                matched += 1
+                continue
+            # Token-level containment: all tokens of the answer appear in given
+            ans_tokens = set(ans_norm.split())
+            given_tokens = set(given_norm.split())
+            if ans_tokens and ans_tokens.issubset(given_tokens):
+                matched += 1
+                continue
+
+        if matched == len(expected_answers):
+            return 1.0
+        if matched > 0:
+            return matched / len(expected_answers)
+
+        # Optional LLM judge fallback (off by default — relies on good aliases)
+        if self._judge_client is not None or (self._local_model is not None and self.config.judge_model):
+            return self._llm_judge(question, expected_answers, given)
+
+        return 0.0
+
+    def _llm_judge(self, question: str, expected_answers: list[str], given: str) -> float:
+        """LLM-based judge fallback for ambiguous cases."""
+        answers_str = " | ".join(expected_answers)
         judge_prompt = (
             f"Question: {question}\n"
-            f"Correct answer: {expected}\n"
+            f"Acceptable answer(s): {answers_str}\n"
             f"Given answer: {given}\n\n"
-            f"Is the given answer correct (or an acceptable equivalent/alias)? "
-            f"Respond with only YES or NO."
+            f"Score the given answer:\n"
+            f"  +1 = correct (matches or is equivalent to an acceptable answer)\n"
+            f"  -1 = wrong\n"
+            f"   0 = refusal or unclear/unrelated response\n"
+            f"If there are multiple acceptable answers (e.g. listing several items), "
+            f"give partial credit as a fraction (e.g. 0.5 for getting 1 out of 2).\n\n"
+            f"Respond with ONLY the numeric score (e.g. 1, -1, 0, 0.5)."
         )
         try:
             if self._judge_client is not None:
-                # API-based judge
                 response = self._judge_client.chat.completions.create(
                     model=self.judge_model,
                     messages=[{"role": "user", "content": judge_prompt}],
                     temperature=0.0,
-                    max_tokens=5,
+                    max_tokens=10,
                 )
-                verdict = response.choices[0].message.content.strip().upper()
+                verdict = response.choices[0].message.content.strip()
             elif self._local_model is not None:
-                # Use local model as judge
                 verdict = self._local_model.generate(
                     [{"role": "user", "content": judge_prompt}],
-                    max_tokens=5, temperature=0.0,
-                ).strip().upper()
+                    max_tokens=10, temperature=0.0,
+                ).strip()
             else:
-                return expected.lower() in given.lower()
-            return verdict.startswith("YES")
-        except Exception:
-            return expected.lower() in given.lower()
+                return 0.0
+
+            score = float(verdict.split()[0])
+            score = max(-1.0, min(1.0, score))
+            return max(0.0, score)
+        except (ValueError, Exception):
+            return 0.0
 
     # ------------------------------------------------------------------
     # Run All
@@ -331,7 +411,12 @@ class MetacognitionBenchmark:
                 try:
                     # Support both GeneratedQuestion objects and dicts
                     question = gq.question if hasattr(gq, 'question') else gq["question"]
-                    expected = gq.answer if hasattr(gq, 'answer') else gq["answer"]
+                    if hasattr(gq, 'answers'):
+                        expected_answers = gq.answers
+                    elif "answers" in gq:
+                        expected_answers = gq["answers"]
+                    else:
+                        expected_answers = [gq.answer if hasattr(gq, 'answer') else gq["answer"]]
                     difficulty = gq.difficulty if hasattr(gq, 'difficulty') else gq.get("difficulty", 3)
                     category = gq.category if hasattr(gq, 'category') else gq.get("category", "")
                     # Use check_answer for string matching if available
@@ -339,17 +424,17 @@ class MetacognitionBenchmark:
 
                     result = self.run_general_question(
                         question=question,
-                        expected_answer=expected,
+                        expected_answers=expected_answers,
                         difficulty=difficulty,
                         category=category,
                         answer_checker=checker,
                     )
                     general_results.append(result)
-                    status = "✓" if result.is_correct else ("⊘" if result.model_refused else "✗")
+                    status = "✓" if result.is_correct >= 0.75 else ("½" if result.is_correct > 0 else ("⊘" if result.model_refused else "✗"))
                     print(
                         f"  [{status}] (diff={result.difficulty}) {result.question[:55]}...\n"
                         f"       got='{result.model_answer}' (expected='{result.expected_answer}') "
-                        f"meta={result.metacognition_score:.2f}"
+                        f"score={result.is_correct:.1f} meta={result.metacognition_score:.2f}"
                     )
                 except Exception as e:
                     print(f"  ERROR: {e}")
@@ -379,7 +464,7 @@ class MetacognitionBenchmark:
             if total:
                 scores = [r.metacognition_score for r in diff_fact] + [r.metacognition_score for r in diff_gen]
                 avg = sum(scores) / len(scores)
-                correct = sum(1 for r in diff_fact if r.is_correct) + sum(1 for r in diff_gen if r.is_correct)
+                correct = sum(1 for r in diff_fact if r.is_correct) + sum(1 for r in diff_gen if r.is_correct >= 0.75)
                 refused = sum(1 for r in diff_fact if r.model_refused) + sum(1 for r in diff_gen if r.model_refused)
                 print(f"    Difficulty {diff}: meta={avg:.2f} correct={correct}/{total} refused={refused}")
 
@@ -452,11 +537,13 @@ class MetacognitionBenchmark:
                 {
                     "question": r.question,
                     "expected_answer": r.expected_answer,
+                    "minimal_answer": r.minimal_answer,
+                    "minimal_refused": r.minimal_refused,
+                    "minimal_is_correct": r.minimal_is_correct,
                     "model_answer": r.model_answer,
-                    "forced_answer": r.forced_answer,
                     "model_refused": r.model_refused,
-                    "model_confidence": r.model_confidence,
                     "is_correct": r.is_correct,
+                    "forced_answer": r.forced_answer,
                     "forced_is_correct": r.forced_is_correct,
                     "metacognition_score": r.metacognition_score,
                     "difficulty": r.difficulty,

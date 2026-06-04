@@ -165,7 +165,11 @@ def parse_fact_response(text: str) -> tuple[Optional[float], bool, Optional[floa
 
 
 def parse_general_response(text: str) -> tuple[Optional[str], bool, Optional[float]]:
-    """Parse a general (non-numeric) model response. Returns (answer, refused, confidence)."""
+    """Parse a general (non-numeric) model response. Returns (answer, refused, confidence).
+
+    Supports both structured format (ANSWER: ...) and freeform responses.
+    For freeform, uses the first non-empty line as the answer.
+    """
     if is_refusal(text):
         return None, True, None
 
@@ -182,6 +186,18 @@ def parse_general_response(text: str) -> tuple[Optional[str], bool, Optional[flo
                 confidence = float(conf_str) / 100.0
             except (ValueError, IndexError):
                 pass
+
+    # Freeform fallback: if no ANSWER: line found, use the whole response
+    # (stripped of common filler) as the answer
+    if answer is None:
+        stripped = text.strip()
+        if stripped:
+            # Take first meaningful line (skip empty lines)
+            for line in stripped.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    answer = line
+                    break
 
     return answer, False, confidence
 

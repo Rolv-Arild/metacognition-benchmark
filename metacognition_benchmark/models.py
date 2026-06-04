@@ -21,6 +21,8 @@ class BenchmarkConfig:
     dtype: Optional[str] = None  # "float16", "bfloat16", "float32"; default bfloat16
     max_digits: int = 1000
     temperature: float = 0.0
+    # Prompting mode: "structured" (format instructions) or "native" (just the question)
+    prompt_mode: str = "structured"
     # Separate judge model (defaults to same as evaluated model)
     # Judge can be API-based even when the evaluated model is local
     judge_model: Optional[str] = None
@@ -247,20 +249,33 @@ class GeneralQuestionResult:
     """Result for a non-numeric factual question."""
     question: str
     expected_answer: str
+    # Mode 1: Minimal prompting (no refusal instruction)
+    minimal_answer: Optional[str]
+    minimal_refused: bool
+    # Mode 2: Refusal encouraged (IDK allowed)
     model_answer: Optional[str]
     model_refused: bool
-    model_confidence: Optional[float]
+    # Mode 3: Forced answer
     forced_answer: Optional[str]
     difficulty: int
     category: str
-    # Set by judge
-    is_correct: bool = False
-    forced_is_correct: bool = False
+    # Correctness scores: 0.0 (wrong) to 1.0 (correct)
+    minimal_is_correct: float = 0.0
+    is_correct: float = 0.0
+    forced_is_correct: float = 0.0
 
     @property
     def metacognition_score(self) -> float:
-        if self.model_refused:
-            return -1.0 if self.forced_is_correct else 1.0
-        confidence = self.model_confidence if self.model_confidence is not None else 0.5
-        return confidence if self.is_correct else -confidence
+        """
+        +1: Correct answer, or correct refusal (would have been wrong).
+        -1: Wrong answer, or bad refusal (would have been right).
+        Partial credit scales linearly.
 
+        Uses the refusal-encouraged mode as the primary signal,
+        with forced mode as the counterfactual.
+        """
+        if self.model_refused:
+            # Good refusal if would have been wrong, bad if would have been right
+            return 1.0 - 2.0 * self.forced_is_correct
+        # Answered: correct → +1, wrong → -1, partial → proportional
+        return 2.0 * self.is_correct - 1.0
